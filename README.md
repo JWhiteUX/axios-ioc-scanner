@@ -13,7 +13,7 @@ The malicious `axios@1.14.1` and `axios@0.30.4` packages injected a phantom depe
 | 1 | **Filesystem artifacts** | Platform-specific RAT binaries and dropper remnants (`com.apple.act.mond`, `wt.exe`, `system.bat`, `/tmp/ld.py`, temp VBS/PS1 files) |
 | 2 | **Registry persistence** | Windows `MicrosoftUpdate` Run key → `system.bat` |
 | 3 | **node_modules crawl** | Finds `plain-crypto-js` directories anywhere on disk, flags the anti-forensics `package.json` swap |
-| 4 | **Lockfile scan** | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` for malicious package versions |
+| 4 | **Lockfile scan** | Format-aware parsing of `package-lock.json` (v1/v2/v3), `yarn.lock`, and `pnpm-lock.yaml` — matches exact package names to avoid false positives from similarly-named packages (e.g. `gaxios` vs `axios`) or unrelated packages at the same version |
 | 5 | **Network connections** | Active connections to C2 IP `142.11.206.73`, DNS cache hits for `sfrclak.com`, `calltan.com`, `callnrwise.com` |
 | 6 | **Running processes** | RAT processes with context-aware filtering (e.g. `wt.exe` only flagged from `ProgramData`, not legit Windows Terminal) |
 | 7 | **npm cache** | SHA-256 hash matching against known payload hashes in the content-addressed cache store |
