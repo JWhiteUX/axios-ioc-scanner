@@ -223,11 +223,92 @@ def check_node_modules():
         print(f"  {GRN}[OK]{RST} No plain-crypto-js directories found")
 
 
+def _check_package_lock_json(fp, content):
+    """Parse package-lock.json and check for exact malicious package matches."""
+    hits = []
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return hits
+
+    # lockfile v2/v3: "packages" keyed by path like "node_modules/axios"
+    packages = data.get("packages", {})
+    for key, info in packages.items():
+        # Extract bare package name from key (e.g. "node_modules/axios" → "axios",
+        # "node_modules/@scope/pkg" → "@scope/pkg")
+        parts = key.rsplit("node_modules/", 1)
+        pkg_name = parts[-1] if len(parts) > 1 else key
+        if pkg_name in MALICIOUS_PACKAGES:
+            ver = info.get("version", "")
+            if ver in MALICIOUS_PACKAGES[pkg_name]:
+                hits.append((pkg_name, ver))
+
+    # lockfile v1: "dependencies" keyed by exact package name
+    dependencies = data.get("dependencies", {})
+    for pkg_name, info in dependencies.items():
+        if pkg_name in MALICIOUS_PACKAGES:
+            ver = info.get("version", "")
+            if ver in MALICIOUS_PACKAGES[pkg_name]:
+                hits.append((pkg_name, ver))
+
+    return hits
+
+
+def _check_yarn_lock(fp, content):
+    """Parse yarn.lock and check for exact malicious package matches."""
+    hits = []
+    for pkg, versions in MALICIOUS_PACKAGES.items():
+        # yarn.lock entries start with the package name at column 0:
+        #   "axios@^1.14.0":      (yarn v1 quoted)
+        #   axios@^1.14.0:        (yarn v1 unquoted)
+        # Followed by indented fields including:  version "1.14.1"
+        # Match entry headers that reference this exact package (not substrings)
+        pattern = re.compile(
+            r'^"?' + re.escape(pkg) + r'@[^"]*"?:\s*\n'
+            r'(?:  .+\n)*?'
+            r'  version "([^"]+)"',
+            re.MULTILINE,
+        )
+        for m in pattern.finditer(content):
+            ver = m.group(1)
+            if ver in versions:
+                hits.append((pkg, ver))
+    return hits
+
+
+def _check_pnpm_lock(fp, content):
+    """Parse pnpm-lock.yaml and check for exact malicious package matches."""
+    hits = []
+    for pkg, versions in MALICIOUS_PACKAGES.items():
+        for ver in versions:
+            # pnpm-lock.yaml formats:
+            #   /axios@1.14.1:          (pnpm v6)
+            #   /axios/1.14.1:          (pnpm v7+)
+            #   'axios@1.14.1':         (pnpm v9+ importers)
+            #   axios: 1.14.1           (specifiers section)
+            patterns = [
+                re.compile(r'/' + re.escape(pkg) + r'[@/]' + re.escape(ver) + r'[:/\s]'),
+                re.compile(r"'" + re.escape(pkg) + r'@' + re.escape(ver) + r"'"),
+                re.compile(r'^\s+' + re.escape(pkg) + r':\s+' + re.escape(ver) + r'\s*$', re.MULTILINE),
+            ]
+            for pat in patterns:
+                if pat.search(content):
+                    hits.append((pkg, ver))
+                    break
+    return hits
+
+
 def check_lockfiles():
     print(f"\n{BOLD}[4/7] Lockfile scan (package-lock.json / yarn.lock / pnpm-lock.yaml){RST}")
     home = Path.home()
     lockfile_names = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"]
     hit = False
+
+    checkers = {
+        "package-lock.json": _check_package_lock_json,
+        "yarn.lock": _check_yarn_lock,
+        "pnpm-lock.yaml": _check_pnpm_lock,
+    }
 
     for root, dirs, files in os.walk(home, topdown=True):
         dirs[:] = [d for d in dirs if d not in {
@@ -243,25 +324,18 @@ def check_lockfiles():
                 except (PermissionError, OSError):
                     continue
 
-                # Check for malicious package versions
-                for pkg, versions in MALICIOUS_PACKAGES.items():
-                    for ver in versions:
-                        patterns = [
-                            f'"{pkg}": "{ver}"',
-                            f'"{pkg}@{ver}"',
-                            f"{pkg}@{ver}",
-                            f'"version": "{ver}"',
-                        ]
-                        # More targeted: look for package + version proximity
-                        if pkg in content:
-                            for pat in patterns:
-                                if pat in content:
-                                    finding("CRITICAL", "lockfile",
-                                            f"References {pkg}@{ver}", fp)
-                                    hit = True
-                                    break
+                # Format-aware check for malicious packages
+                checker = checkers[lf]
+                seen = set()
+                for pkg, ver in checker(fp, content):
+                    key = (pkg, ver, fp)
+                    if key not in seen:
+                        seen.add(key)
+                        finding("CRITICAL", "lockfile",
+                                f"References {pkg}@{ver}", fp)
+                        hit = True
 
-                # Check for plain-crypto-js anywhere
+                # plain-crypto-js is unique enough for substring matching
                 if "plain-crypto-js" in content:
                     finding("CRITICAL", "lockfile",
                             "Contains reference to plain-crypto-js", fp)
