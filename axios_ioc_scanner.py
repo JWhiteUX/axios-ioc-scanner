@@ -86,10 +86,21 @@ def finding(severity, category, detail, path=None):
     print(f"  {prefix} [{category}] {detail}{loc}")
 
 
+MAX_HASH_BYTES = 100 * 1024 * 1024      # 100 MB
+MAX_LOCKFILE_BYTES = 50 * 1024 * 1024    # 50 MB
+MAX_CACHE_FILES = 100_000
+MAX_CACHE_FILE_BYTES = 20 * 1024 * 1024  # 20 MB — known payloads are small
+
+
 def sha256_file(path):
     import hashlib
-    h = hashlib.sha256()
     try:
+        if os.path.islink(path):
+            return None
+        size = os.path.getsize(path)
+        if size > MAX_HASH_BYTES:
+            return None
+        h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
@@ -180,8 +191,11 @@ def check_node_modules():
 
     hit = False
     checked = 0
+    limit_reached = False
     print(f"  Searching under: {', '.join(str(r) for r in sorted(search_roots))}")
     for root in sorted(search_roots):
+        if limit_reached:
+            break
         for dirpath, dirnames, _files in os.walk(root, topdown=True):
             # Prune to avoid excessive crawling
             dirnames[:] = [
@@ -192,6 +206,7 @@ def check_node_modules():
             checked += 1
             if checked > 500_000:
                 print(f"  {YEL}[WARN]{RST} Hit directory limit, stopping crawl")
+                limit_reached = True
                 break
 
             nm = os.path.join(dirpath, "node_modules", "plain-crypto-js")
@@ -319,14 +334,18 @@ def check_lockfiles():
             if lf in files:
                 fp = os.path.join(root, lf)
                 try:
+                    if os.path.getsize(fp) > MAX_LOCKFILE_BYTES:
+                        print(f"  {YEL}[WARN]{RST} Skipping oversized lockfile: {fp}")
+                        continue
                     with open(fp, "r", errors="ignore") as f:
-                        content = f.read()
+                        content = f.read(MAX_LOCKFILE_BYTES)
                 except (PermissionError, OSError):
                     continue
 
                 # Format-aware check for malicious packages
                 checker = checkers[lf]
                 seen = set()
+                format_hit = False
                 for pkg, ver in checker(fp, content):
                     key = (pkg, ver, fp)
                     if key not in seen:
@@ -334,9 +353,10 @@ def check_lockfiles():
                         finding("CRITICAL", "lockfile",
                                 f"References {pkg}@{ver}", fp)
                         hit = True
+                        format_hit = True
 
-                # plain-crypto-js is unique enough for substring matching
-                if "plain-crypto-js" in content:
+                # Fallback substring check only if format-aware pass didn't match
+                if not format_hit and "plain-crypto-js" in content:
                     finding("CRITICAL", "lockfile",
                             "Contains reference to plain-crypto-js", fp)
                     hit = True
@@ -389,16 +409,17 @@ def check_processes():
     print(f"\n{BOLD}[6/7] Running processes{RST}")
     hit = False
 
+    # Use word-boundary patterns to avoid false positives on partial matches.
+    # Each entry: (compiled regex, label, requires_extra_validation)
     suspicious_patterns = [
-        "com.apple.act.mond",   # macOS RAT binary
-        "wt.exe",               # Renamed powershell.exe on Windows
-        "ld.py",                # Linux RAT script
-        "plain-crypto-js",      # Dropper remnants
-        "setup.js",             # Dropper script
-        "6202033",              # Campaign identifier in filenames
-        "sfrclak",              # C2 domain in args
-        "calltan",              # Related C2
-        "callnrwise",           # Related C2
+        (re.compile(r'com\.apple\.act\.mond\b', re.I), "com.apple.act.mond", False),
+        (re.compile(r'\bwt\.exe\b', re.I), "wt.exe", True),
+        (re.compile(r'(?:^|[/\\])ld\.py\b', re.I), "ld.py", False),
+        (re.compile(r'\bplain-crypto-js\b', re.I), "plain-crypto-js", False),
+        (re.compile(r'\b6202033\b', re.I), "6202033", False),
+        (re.compile(r'\bsfrclak\.com\b', re.I), "sfrclak.com", False),
+        (re.compile(r'\bcalltan\.com\b', re.I), "calltan.com", False),
+        (re.compile(r'\bcallnrwise\.com\b', re.I), "callnrwise.com", False),
     ]
 
     if sys.platform == "win32":
@@ -412,19 +433,20 @@ def check_processes():
     else:
         out = run_cmd(["ps", "auxww"])
 
-    for pat in suspicious_patterns:
-        matches = [line for line in out.splitlines() if pat.lower() in line.lower()]
+    for regex, label, needs_validation in suspicious_patterns:
+        matches = [line for line in out.splitlines() if regex.search(line)]
         for m in matches:
             # wt.exe needs extra validation — it's also legit Windows Terminal
-            if pat == "wt.exe":
+            if needs_validation and label == "wt.exe":
                 m_lower = m.lower()
                 if "programdata" in m_lower or "\\programdata\\" in m_lower:
                     finding("CRITICAL", "process",
-                            f"wt.exe running from ProgramData (likely renamed powershell): {m.strip()}")
+                            f"wt.exe running from ProgramData (likely renamed powershell)")
                     hit = True
                 # Legit wt.exe is in WindowsApps — skip those
                 continue
-            finding("CRITICAL", "process", f"Suspicious process: {m.strip()}")
+            # Redact full command line — report the match label, not raw args
+            finding("CRITICAL", "process", f"Suspicious process matched pattern: {label}")
             hit = True
 
     if not hit:
@@ -449,15 +471,27 @@ def check_npm_cache():
     if os.path.isdir(content_v2):
         # Walk the content-addressed store looking for known hashes
         all_hashes = set(PAYLOAD_HASHES_SHA256.values())
+        cache_files_checked = 0
         for root, _dirs, files in os.walk(content_v2):
             for fname in files:
-                # content-v2 stores files by sha512, but we can hash them
+                if cache_files_checked >= MAX_CACHE_FILES:
+                    print(f"  {YEL}[WARN]{RST} Hit cache file limit ({MAX_CACHE_FILES}), stopping")
+                    break
                 fp = os.path.join(root, fname)
+                try:
+                    if os.path.getsize(fp) > MAX_CACHE_FILE_BYTES:
+                        continue
+                except OSError:
+                    continue
+                cache_files_checked += 1
                 h = sha256_file(fp)
                 if h and h in all_hashes:
                     finding("CRITICAL", "npm-cache",
                             f"Cached malicious payload (SHA-256 match): {h}", fp)
                     hit = True
+            else:
+                continue
+            break  # Break outer loop when inner limit hit
     else:
         print(f"  {CYN}[INFO]{RST} npm content cache not found at expected path")
 
@@ -509,7 +543,8 @@ def print_summary():
         },
     }
     try:
-        with open(report_path, "w") as f:
+        fd = os.open(str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(report, f, indent=2)
         print(f"\nJSON report: {report_path}")
     except OSError as e:
